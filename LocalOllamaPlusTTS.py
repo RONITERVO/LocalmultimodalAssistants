@@ -23,6 +23,7 @@ import fitz
 from tkinterdnd2 import TkinterDnD, DND_FILES
 import re
 from typing import Optional
+import json
 
 
 # ===================
@@ -37,6 +38,7 @@ CHANNELS = 1
 SILENCE_THRESHOLD_SECONDS = 1.0 # How long silence triggers end of recording
 MIN_SPEECH_DURATION_SECONDS = 0.2 # Ignore very short bursts
 PRE_SPEECH_BUFFER_SECONDS = 0.3 # Keep audio before speech starts
+
 
 # --- UI ---
 APP_TITLE = "Ollama Multimodal Chat++ (Streaming, TTS, VAD)"
@@ -54,6 +56,8 @@ WHISPER_LANGUAGES = [
 ]
 WHISPER_MODEL_SIZES = ["tiny", "base", "small", "medium", "large", "turbo-tiny", "turbo-base", "turbo-small", "turbo-medium", "turbo-large"]
 
+SYSTEM_PROMPTS_FILE = "system_prompts.json"
+
 # ===================
 # Globals
 # ===================
@@ -66,6 +70,9 @@ stream_queue = queue.Queue()
 stream_done_event = threading.Event()
 stream_in_progress = False
 chat_history_widget = None # Assign after Tkinter setup
+system_prompt_input_widget = None # Assign after Tkinter setup
+system_prompt_selector = None # Assign after Tkinter setup
+saved_system_prompts = {}
 
 # --- TTS ---
 tts_engine = None
@@ -104,6 +111,87 @@ is_recording_for_whisper = False # State flag for VAD-triggered recording
 audio_frames_buffer = deque() # Holds raw audio data during VAD recording
 vad_audio_buffer = deque(maxlen=int(RATE / VAD_CHUNK * 1.5)) # Rolling buffer for VAD analysis (~1.5 sec)
 temp_audio_file_path = None # Path for the temporary WAV file
+
+
+#============================
+#System Prompt Management
+#============================
+
+def load_system_prompts():
+    """Loads system prompts from the JSON file."""
+    global saved_system_prompts
+    try:
+        if os.path.exists(SYSTEM_PROMPTS_FILE):
+            with open(SYSTEM_PROMPTS_FILE, 'r') as f:
+                saved_system_prompts = json.load(f)
+            print(f"[Prompts] Loaded {len(saved_system_prompts)} system prompts.")
+    except (json.JSONDecodeError, IOError) as e:
+        print(f"[Prompts] Error loading system prompts file: {e}")
+        saved_system_prompts = {} # Start with an empty dict on error
+
+def save_system_prompts_to_file():
+    """Saves the current system prompts to the JSON file."""
+    global saved_system_prompts
+    try:
+        with open(SYSTEM_PROMPTS_FILE, 'w') as f:
+            json.dump(saved_system_prompts, f, indent=4)
+        print("[Prompts] System prompts saved to file.")
+    except IOError as e:
+        print(f"[Prompts] Error saving system prompts file: {e}")
+
+def populate_system_prompt_selector():
+    """Updates the system prompt dropdown with loaded prompts."""
+    if system_prompt_selector:
+        prompt_names = list(saved_system_prompts.keys())
+        # Add an empty option at the beginning to allow deselecting
+        system_prompt_selector['values'] = [""] + prompt_names
+        system_prompt_selector.set("")
+
+def on_system_prompt_selected(event=None):
+    """Handles selection from the system prompt dropdown."""
+    selected_name = system_prompt_selector.get()
+    if system_prompt_input_widget:
+        system_prompt_input_widget.delete("1.0", tk.END)
+        if selected_name and selected_name in saved_system_prompts:
+            prompt_text = saved_system_prompts[selected_name]
+            system_prompt_input_widget.insert("1.0", prompt_text)
+
+def save_current_system_prompt():
+    """Saves the text in the input box as a new named prompt."""
+    from tkinter.simpledialog import askstring
+    prompt_text = system_prompt_input_widget.get("1.0", tk.END).strip()
+    if not prompt_text:
+        add_message_to_ui("error", "Cannot save an empty system prompt.")
+        return
+
+    prompt_name = askstring("Save Prompt", "Enter a name for this system prompt:")
+    if prompt_name: # User provided a name
+        saved_system_prompts[prompt_name] = prompt_text
+        save_system_prompts_to_file()
+        populate_system_prompt_selector()
+        system_prompt_selector.set(prompt_name)
+        add_message_to_ui("status", f"System prompt '{prompt_name}' saved.")
+
+def delete_selected_system_prompt():
+    """Deletes the currently selected system prompt."""
+    from tkinter.messagebox import askyesno
+    selected_name = system_prompt_selector.get()
+    if not selected_name:
+        add_message_to_ui("error", "No system prompt selected to delete.")
+        return
+
+    if askyesno("Confirm Delete", f"Are you sure you want to delete the prompt '{selected_name}'?"):
+        if selected_name in saved_system_prompts:
+            del saved_system_prompts[selected_name]
+            save_system_prompts_to_file()
+            populate_system_prompt_selector() # This also clears selection
+            system_prompt_input_widget.delete("1.0", tk.END)
+            add_message_to_ui("status", f"System prompt '{selected_name}' deleted.")
+
+def clear_system_prompt_fields():
+    """Clears the system prompt input and selection."""
+    system_prompt_selector.set("")
+    system_prompt_input_widget.delete("1.0", tk.END)
 
 # ===================
 # TTS Setup & Control
@@ -1089,7 +1177,7 @@ def fetch_available_models():
         # Provide common fallbacks if API fails
         return [DEFAULT_OLLAMA_MODEL, "llama3:8b", "phi3:mini"]
 
-def chat_worker(user_message_content, image_path=None):
+def chat_worker(user_message_content, system_prompt_content, image_path=None):
     """Background worker for Ollama streaming chat."""
     global messages, current_model, stream_queue, stream_done_event, stream_in_progress
 
@@ -1110,9 +1198,17 @@ def chat_worker(user_message_content, image_path=None):
 
     # Add user message to history *before* sending to Ollama
     messages.append(current_message)
-    
-    # Prepare message history for Ollama (copy to avoid modifying global during iteration)
-    history_for_ollama = list(messages) 
+
+    # --- Prepare message history for Ollama ---
+    # Create a new history list for this specific API call
+    history_for_ollama = []
+
+    # 1. Add the system prompt if it exists (passed as an argument)
+    if system_prompt_content:
+        history_for_ollama.append({"role": "system", "content": system_prompt_content})
+
+    # 2. Add the rest of the conversation history
+    history_for_ollama.extend(messages)
 
     assistant_response = "" # Accumulate full response for history
 
@@ -1273,6 +1369,11 @@ def send_message(event=None):
     user_text = user_input_widget.get("1.0", tk.END).strip()
     image_to_send = selected_image_path if not image_sent_in_history else None
 
+    # Get system prompt text from the UI in the main thread
+    system_prompt_text = ""
+    if system_prompt_input_widget:
+        system_prompt_text = system_prompt_input_widget.get("1.0", tk.END).strip()
+
     if not user_text and not image_to_send:
         add_message_to_ui("error", "Please enter a message or attach a new image.")
         return
@@ -1313,7 +1414,8 @@ def send_message(event=None):
         with tts_busy_lock: tts_busy = False # Reset busy state
 
     # --- Start Ollama worker thread ---
-    thread = threading.Thread(target=chat_worker, args=(user_text, image_to_send), daemon=True)
+    # Pass the system prompt text to the worker
+    thread = threading.Thread(target=chat_worker, args=(user_text, system_prompt_text, image_to_send), daemon=True)
     thread.start()
 
     # --- Set flags and start polling ---
@@ -1525,6 +1627,35 @@ auto_send_checkbox.pack(anchor="w", pady=2)
 recording_indicator_widget = tk.Label(voice_outer_frame, text="Voice Disabled", font=("Arial", 9, "italic"), fg="grey", anchor="w")
 recording_indicator_widget.pack(fill=tk.X, pady=(5,2), padx=2)
 
+# --- System Prompt Frame ---
+system_prompt_frame = tk.LabelFrame(main_frame, text="System Prompt (Optional)", padx=5, pady=5)
+system_prompt_frame.pack(fill=tk.X, expand=False, pady=(0, 10))
+system_prompt_frame.columnconfigure(0, weight=1) # Input area
+system_prompt_frame.columnconfigure(1, weight=0) # Buttons for actions
+
+# Left side: Combobox and Text Input
+sys_prompt_left_frame = tk.Frame(system_prompt_frame)
+sys_prompt_left_frame.grid(row=0, column=0, sticky="nsew")
+
+system_prompt_selector = ttk.Combobox(sys_prompt_left_frame, state="readonly", width=40)
+system_prompt_selector.pack(fill=tk.X, expand=True, pady=(0, 5))
+system_prompt_selector.bind("<<ComboboxSelected>>", on_system_prompt_selected)
+
+system_prompt_input_widget = scrolledtext.ScrolledText(sys_prompt_left_frame, wrap=tk.WORD, height=3, font=("Arial", 9))
+system_prompt_input_widget.pack(fill=tk.BOTH, expand=True)
+
+# Right side: Buttons
+sys_prompt_button_frame = tk.Frame(system_prompt_frame)
+sys_prompt_button_frame.grid(row=0, column=1, sticky="ns", padx=(10, 0))
+
+save_prompt_button = tk.Button(sys_prompt_button_frame, text="Save", command=save_current_system_prompt)
+save_prompt_button.pack(fill=tk.X, pady=2)
+
+delete_prompt_button = tk.Button(sys_prompt_button_frame, text="Delete", command=delete_selected_system_prompt)
+delete_prompt_button.pack(fill=tk.X, pady=2)
+
+clear_prompt_button = tk.Button(sys_prompt_button_frame, text="Clear", command=clear_system_prompt_fields)
+clear_prompt_button.pack(fill=tk.X, pady=2)
 
 # --- Chat History ---
 chat_frame = tk.LabelFrame(main_frame, text="Chat History", padx=5, pady=5)
@@ -1601,6 +1732,10 @@ user_input_widget.bind("<KeyPress-Return>", on_enter_press)
 
 # --- Final Setup and Initialization ---
 window.protocol("WM_DELETE_WINDOW", on_closing) # Set close handler
+
+# Load saved system prompts and populate the UI
+load_system_prompts()
+populate_system_prompt_selector()
 
 # Attempt to initialize TTS early but don't block startup
 # Let toggle_tts handle enabling controls based on success
