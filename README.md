@@ -3,8 +3,7 @@
 
 An advanced, feature-rich desktop chat client for [Ollama](https://ollama.com/) that brings together streaming, Text-to-Speech (TTS), and state-of-the-art, hands-free Voice Activity Detection (VAD) for a seamless conversational AI experience.
 
- 
-*(Suggestion: Replace this with a real screenshot of your application)*
+![image](https://github.com/user-attachments/assets/7242c6ca-e0dd-476a-a989-b84d9c7a215f)
 
 This application is designed for power users who want a responsive, multimodal, and highly interactive way to chat with local LLMs. It leverages extensive threading to ensure the UI remains fluid and responsive, even while handling audio processing, transcription, and model inference simultaneously.
 
